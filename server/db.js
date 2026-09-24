@@ -223,6 +223,18 @@ for (const t of ['plots', 'animals', 'weather_events', 'weather_log', 'productio
   }
 }
 
+// 加工坊多人协作：工单补计划顺序 seq 与创建者 created_by；
+// 旧工单按创建先后（id）回填 seq，created_by 留空视为全场共有（成员仍可取消/重排）
+if (tableExists('production_jobs')) {
+  if (!columnExists('production_jobs', 'seq')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN seq INTEGER NOT NULL DEFAULT 0')
+    db.exec('UPDATE production_jobs SET seq=id WHERE seq=0')
+  }
+  if (!columnExists('production_jobs', 'created_by')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN created_by INTEGER DEFAULT NULL')
+  }
+}
+
 // 全新存档：建立完整多农场版表结构
 db.exec(`
 CREATE TABLE IF NOT EXISTS player (
@@ -369,6 +381,8 @@ CREATE TABLE IF NOT EXISTS production_jobs (
   enqueue_abs INTEGER NOT NULL,         -- 排产时的绝对天
   cancel_abs INTEGER DEFAULT NULL,      -- 取消时的绝对天（NULL 未取消）
   inputs TEXT DEFAULT NULL,             -- 按批次登记的实际投料明细（JSON，取消时原样退回）
+  seq INTEGER NOT NULL DEFAULT 0,       -- 队内计划顺序（多人协作可重排；新单排到队尾）
+  created_by INTEGER DEFAULT NULL,      -- 排产成员 users.id（NULL=旧存档共有工单）
   status TEXT NOT NULL DEFAULT 'running' -- running/done/canceled/collected
 );
 
@@ -446,7 +460,7 @@ export const ROLE_PERMS = {
     'plant', 'water', 'fertilize', 'clean', 'harvest',
     'protect', 'buymat', 'buyseed', 'sellcrop',
     'adopt', 'feed', 'collect',
-    'enqueue', 'cancelJob', 'collectJob',
+    'enqueue', 'cancelJob', 'collectJob', 'productionReorder',
     'irrigToggle', 'irrigPriority', 'irrigTarget',
     'careTrial', 'cancelTrial'
   ]),

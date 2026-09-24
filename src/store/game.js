@@ -71,6 +71,7 @@ export const useGameStore = defineStore('game', {
     weatherLog: [],
     recipes: [],
     productionJobs: [],
+    productionReserved: [],
     queueCapacity: 0,
     queuedBatches: 0,
     breeding: null,
@@ -102,13 +103,16 @@ export const useGameStore = defineStore('game', {
       }
       // 成员可用权限白名单（与服务端 ROLE_PERMS.member 对齐）
       return ['plant', 'water', 'fertilize', 'clean', 'harvest', 'protect', 'buymat', 'buyseed',
-        'sellcrop', 'adopt', 'feed', 'collect', 'enqueue', 'cancelJob', 'collectJob',
+        'sellcrop', 'adopt', 'feed', 'collect', 'enqueue', 'cancelJob', 'collectJob', 'productionReorder',
         'irrigToggle', 'irrigPriority', 'irrigTarget', 'careTrial', 'cancelTrial'].includes(perm)
     },
     // 管理员+
     canManage: (s) => s.role === 'admin' || s.role === 'owner',
     canOwner: (s) => s.role === 'owner',
     activeFarms: (s) => s.myFarms.filter((f) => f.status === 'active'),
+    // 协作排产：某物品被全农场在制工单未开工批次占用（可退）的数量
+    reservedOf: (s) => (itemId) =>
+      (s.productionReserved || []).find((it) => it.itemId === itemId)?.qty || 0,
     // 统一作物表：基础作物 + 杂交品种（id 均唯一）
     allCrops: (s) => {
       const vars = (s.varieties || []).map((v) => ({
@@ -279,6 +283,7 @@ export const useGameStore = defineStore('game', {
       this.weatherLog = d.weatherLog || []
       this.recipes = d.recipes || []
       this.productionJobs = d.productionJobs || []
+      this.productionReserved = d.productionReserved || []
       this.queueCapacity = d.queueCapacity || 0
       this.queuedBatches = d.queuedBatches || 0
       this.breeding = d.breeding || null
@@ -442,6 +447,16 @@ export const useGameStore = defineStore('game', {
         } else this.showToast('已取消（无未开工批次可退料）', 'info')
       }, { denyPerm: 'cancelJob' })
     },
+    // 队列重排：把自己未开工的工单上移/下移一位（成员可调自己的，管理员可调全部）
+    async reorderProduction(id, dir) {
+      const r = await this._commit(async () => {
+        const d = await api('/production/reorder', 'POST', { id, dir })
+        await this.load({ silent: true })
+        return d
+      }, { denyPerm: 'productionReorder' })
+      if (r && !r.moved) this.showToast('该方向已没有可交换的排队工单', 'info')
+      return r
+    },
     async collectProduction(id = null) {
       await this._commit(async () => {
         const r = await api('/production/collect', 'POST', id == null ? {} : { id })
@@ -538,6 +553,7 @@ const ACTION_LABELS = {
   nextday: '时间推进/灾害结算', protect: '防灾投入', buymat: '购买物资', buyseed: '购买种子',
   sellcrop: '出售作物', adopt: '领养动物', feed: '喂食', collect: '收集产物',
   'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/collect': '加工入库',
+  'production/reorder': '工单重排',
   'irrigation/build': '建造灌溉设施', 'irrigation/toggle': '灌溉设施启停', 'irrigation/demolish': '拆除灌溉设施',
   'irrigation/priority': '灌溉优先级', 'irrigation/target': '灌溉目标水分',
   'breeding/start': '杂交试验', 'breeding/care': '试验养护', 'breeding/cancel': '取消试验',

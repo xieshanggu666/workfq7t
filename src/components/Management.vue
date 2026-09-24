@@ -61,6 +61,8 @@
       <div class="queue-stat">
         排产占用 <b :class="{full: store.queuedBatches >= store.queueCapacity}">{{ store.queuedBatches }}/{{ store.queueCapacity }}</b> 批
         <span class="tag">每批按游戏天加工，跨天自动推进</span>
+        <span class="tag" v-if="totalReserved">🔒 队列锁定原料 {{ totalReserved }} 件（取消未开工批次可退）</span>
+        <span class="tag coop">👥 成员各自排产，仅可取消/前移自己的工单，管理员可代操作</span>
       </div>
       <div class="row recipe" v-for="r in store.recipes" :key="r.id">
         <span class="i">{{ r.icon }}</span>
@@ -71,7 +73,8 @@
           <span class="tag">{{ r.fromIcon }} {{ r.fromName }} ×{{ r.consume }}/批</span>
           <span class="tag">→ {{ r.name }} ×{{ r.gain }}</span>
           <span class="tag">⏱ {{ r.days }} 天/批</span>
-          <span class="tag" :class="{mixed:r.baseCrop}">库存 ×{{ recipeStock(r) }}{{ r.baseCrop ? '（含🧬品种）' : '' }}</span>
+          <span class="tag" :class="{mixed:r.baseCrop}">可用 ×{{ recipeAvailable(r) }}{{ r.baseCrop ? '（含🧬品种）' : '' }}</span>
+          <span class="tag reserved" v-if="recipeReserved(r)>0">🔒占用 ×{{ recipeReserved(r) }}</span>
         </div>
         <div class="proc-ctl">
           <button class="mini" :disabled="!canMake(r,1)" @click="doEnqueue(r,1)">排产×1</button>
@@ -96,17 +99,39 @@
           <b>
             {{ j.recipe_name }} ×{{ j.status==='canceled' ? j.gain*j.doneBatches : j.gain*j.qty }}
             <span class="job-state" :class="j.computedStatus">{{ stateLabel(j) }}</span>
+            <span class="creator" :title="creatorTitle(j)">👤 {{ j.createdByName || '共有' }}</span>
           </b>
           <span class="tag">批次 {{ j.doneBatches }}/{{ j.qty }}</span>
           <span class="tag" v-if="j.computedStatus==='running'">⏳ 约剩 {{ j.remainDays }} 天</span>
+          <span class="tag" v-if="j.movable">排队顺位 #{{ j.waitOrder }}</span>
           <span class="tag" v-if="j.status==='canceled' && j.refundedBatches>0">已退 {{ j.refundedBatches }} 批原料</span>
+          <!-- 未开工批次锁定的原料（按品种逐项追踪，取消时原样退回） -->
+          <span class="tag reserved" v-for="it in (j.waitingInputs||[])" :key="it.itemId">
+            🔒{{ itemIcon(it) }} {{ it.name }}×{{ it.qty }}
+          </span>
           <div class="job-bar"><i :style="{width:(j.doneBatches/j.qty*100)+'%'}"></i></div>
         </div>
-        <button v-if="j.status==='running'" class="mini" @click="store.cancelProduction(j.id)">取消退料</button>
-        <button v-if="(j.computedStatus==='done' || j.status==='canceled') && j.doneBatches>0"
-                class="mini green" @click="store.collectProduction(j.id)">
-          入库 ×{{ j.gain*j.doneBatches }}
-        </button>
+        <div class="job-ctl">
+          <!-- 仅创建者（或管理员）可重排；正在加工的批次不可挪 -->
+          <template v-if="j.movable">
+            <button class="mini icon-btn" :disabled="j.waitOrder===1"
+                    title="前移一位（不能越过正在加工的批次）"
+                    @click="store.reorderProduction(j.id,'up')">⬆</button>
+            <button class="mini icon-btn"
+                    :disabled="j.waitOrder===movableCount"
+                    title="后移一位"
+                    @click="store.reorderProduction(j.id,'down')">⬇</button>
+          </template>
+          <button v-if="j.status==='running' && j.canCancel" class="mini"
+                  :title="j.created_by ? '' : '旧存档共有工单'"
+                  @click="store.cancelProduction(j.id)">取消退料</button>
+          <button v-if="j.status==='running' && !j.canCancel" class="mini" disabled
+                  title="只能取消自己排产的工单（管理员可代操作）">他人工单</button>
+          <button v-if="(j.computedStatus==='done' || j.status==='canceled') && j.doneBatches>0"
+                  class="mini green" @click="store.collectProduction(j.id)">
+            入库 ×{{ j.gain*j.doneBatches }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -239,6 +264,26 @@ function recipeStock(r) {
   }
   return total
 }
+// 配方原料被全队未开工工单占用（可退）的数量：他人排产锁定的原料自己不能重复排产
+function recipeReserved(r) {
+  if (!r.baseCrop) return store.reservedOf(r.from)
+  let total = store.reservedOf('crop-' + r.baseCrop)
+  for (const v of store.varieties.filter((x) => x.base_id === r.baseCrop)) {
+    total += store.reservedOf('crop-v' + v.id)
+  }
+  return total
+}
+function recipeAvailable(r) { return Math.max(0, recipeStock(r) - recipeReserved(r)) }
+// 全队列占用原料总件数（头部统计条）
+const totalReserved = computed(() =>
+  (store.productionReserved || []).reduce((s, it) => s + it.qty, 0)
+)
+// 占用明细图标：复用背包图标逻辑
+function itemIcon(it) { return iconOf(it) }
+function creatorTitle(j) {
+  if (!j.created_by) return '旧存档共有工单，成员均可取消/重排'
+  return '排产成员：' + j.created_by_name + '（仅本人或管理员可取消/重排）'
+}
 const runningTrials = computed(() => store.breeding?.running || 0)
 function recipeIcon(id) {
   return store.recipes.find((r) => r.id === id)?.icon || '🛠️'
@@ -248,16 +293,18 @@ const freeSlots = computed(() => Math.max(0, store.queueCapacity - store.queuedB
 function canMake(r, n) {
   if (mill.value.level < r.needLv) return false
   if (n > freeSlots.value) return false
-  return recipeStock(r) >= r.consume * n
+  return recipeAvailable(r) >= r.consume * n
 }
 async function doEnqueue(r, n) {
-  // 原料/空位只够一部分时，自动收缩为可做批次数
-  const real = Math.min(n, Math.floor(recipeStock(r) / r.consume), freeSlots.value)
+  // 可用原料/空位只够一部分时自动收缩（已被队列占用的原料不可重复排产）
+  const real = Math.min(n, Math.floor(recipeAvailable(r) / r.consume), freeSlots.value)
   if (real <= 0) return
-  try { await store.enqueueProduction(r.id, real) } catch { /* toast 已提示 */ }
+  try { await store.enqueueProduction(r.id, real) } catch { /* toast */ }
 }
 // 未领走的工单（完工未入库 / 加工中 / 已取消待入库）
 const activeJobs = computed(() => store.productionJobs)
+// 可重排窗口大小（最后一个排队工单的下移按钮据此禁用）
+const movableCount = computed(() => store.productionJobs.filter((j) => j.movable).length)
 // 可入库 = 全部完工 或 已取消（在制工单须整单完工后才能领）
 const collectableJobs = computed(() =>
   store.productionJobs.filter((j) => (j.computedStatus === 'done' || j.status === 'canceled') && j.doneBatches > 0)
@@ -334,4 +381,10 @@ h4 { margin:0 0 8px;color:#fff;display:flex;gap:8px;align-items:center; }
 .job-bar i{display:block;height:100%;background:linear-gradient(90deg,#2962ff,#5c97ff);transition:width .3s;}
 .job.done .job-bar i{background:#43a047;}
 h4 .collect-all{margin-left:auto;font-size:11px;}
+/* 多人协作排产 */
+.tag.reserved{color:#ffb74d;background:#3a2a14;}
+.tag.coop{color:#80cbc4;background:#12302c;}
+.creator{font-size:10px;font-weight:400;color:#8ba2c8;margin-left:6px;}
+.job-ctl{display:flex;gap:4px;flex-shrink:0;align-items:center;flex-wrap:wrap;justify-content:flex-end;max-width:150px;}
+.mini.icon-btn{padding:6px 8px;line-height:1;background:#16263f;border:1px solid rgba(120,160,220,0.25);}
 </style>

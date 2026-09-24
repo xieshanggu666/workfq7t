@@ -1,4 +1,8 @@
 import { db } from './db.js'
+import {
+  replay, finishedBatchesAt, startedBatchesAt, splitIntoBatches,
+  waitingInputsOf, reservedItems, planReorder
+} from './production-core.js'
 
 // ===== 配方表（以服务端为准，前端仅做展示）=====
 // days：每批耗时（游戏天）；needLv：加工坊等级要求
@@ -115,22 +119,17 @@ function consumeItem(farmId, itemId, need) {
   cleanEmpty(farmId)
   return { taken: [{ itemId, name: row.name, cat: row.cat, qty: n }], got: n }
 }
-// 把按消耗顺序排列的扣减明细按每批 consume 个切分，登记到每一批
-// （取消时按批次退还：机器先开的批次先投料，故未开工的尾部批次要原样拿回自己的投料）
-function splitIntoBatches(taken, perBatch, batches) {
-  const flat = []
-  for (const t of taken) for (let i = 0; i < t.qty; i++) flat.push(t)
-  const result = []
-  for (let b = 0; b < batches; b++) {
-    const map = new Map()
-    for (const t of flat.slice(b * perBatch, (b + 1) * perBatch)) {
-      const cur = map.get(t.itemId)
-      if (cur) cur.qty += 1
-      else map.set(t.itemId, { itemId: t.itemId, name: t.name, cat: t.cat, qty: 1 })
-    }
-    result.push([...map.values()])
-  }
-  return result
+// 纯逻辑（队列重放/批次判定/投料拆分/占用汇总/重排计划）见 server/production-core.js
+// 重放与逐批判定在本模块内继续使用；取消/重排逻辑与跨天结算共用同一套计算
+export {
+  replay, finishedBatchesAt, startedBatchesAt,
+  splitIntoBatches, waitingInputsOf, reservedItems, planReorder
+}
+
+// 该农场全部工单重放（含已取消/已入库——它们历史上占用过机器时间，影响后续工单排期）
+// 多人协作：按计划顺序 seq 串行（创建时同序；成员重排只交换 seq），id 仅作并列兜底
+function allJobs(farmId) {
+  return replay(q('SELECT * FROM production_jobs WHERE farm_id=? ORDER BY seq, id', farmId))
 }
 function addInv(farmId, itemId, name, cat, n) {
   const row = q1('SELECT qty FROM inventory WHERE farm_id=? AND item_id=?', farmId, itemId)
@@ -141,61 +140,27 @@ function cleanEmpty(farmId) {
   run('DELETE FROM inventory WHERE farm_id=? AND qty<=0', farmId)
 }
 
-// 截至 absAbs 时，某工单已完工的批次数（取消后不再增加）
-function finishedBatchesAt(j, atAbs) {
-  const stop = j.cancel_abs == null ? Infinity : j.cancel_abs
-  const eff = Math.min(atAbs, stop)
-  return Math.min(j.qty, Math.max(0, Math.floor((eff - j.start) / j.days)))
+// 农场内全部成员名（工单创建者展示用）
+function usersOf(farmId) {
+  return new Map(q(
+    `SELECT u.id, u.name FROM users u
+     JOIN farm_members m ON m.user_id=u.id WHERE m.farm_id=?`, farmId
+  ).map((u) => [u.id, u.name]))
 }
 
-// 截至 absAbs 时，某工单已开工的批次数（正在加工中的批次也算开工，原料不可退）
-function startedBatchesAt(j, atAbs) {
-  const stop = j.cancel_abs == null ? Infinity : j.cancel_abs
-  const eff = Math.min(atAbs, stop)
-  return Math.min(j.qty, Math.max(0, Math.floor((eff - j.start) / j.days) + 1))
-}
-
-// 队列重放：加工坊只有一台机器，按工单创建顺序串行加工，算出每个工单
-//   start  —— 首批开工绝对日（当天 00:00 即可开工）
-//   finish —— 全部批次完工的绝对日（用于预估还剩几天）
-// 取消的工单在 cancel_abs 立刻让出机器，后续工单自动提前；
-// 尚未开工就被取消的工单从未占用机器，游标不得回退（否则后续工单会排到过去、提前产出）。
-function replay(jobs) {
-  let cursor = 0
-  for (const j of jobs) {
-    const start = Math.max(cursor, j.enqueue_abs)
-    j.start = start
-    const stop = j.cancel_abs == null ? Infinity : j.cancel_abs
-    let finish = start
-    for (let b = 0; b < j.qty; b++) {
-      const bEnd = start + (b + 1) * j.days
-      if (bEnd > stop) break
-      finish = bEnd
-    }
-    if (j.cancel_abs == null) {
-      j.finish = finish
-      cursor = finish
-    } else if (start < stop) {
-      // 取消时已有批次开工（可能正加工到一半）：机器一直占用到取消时刻才让出
-      j.finish = stop
-      cursor = stop
-    } else {
-      // 取消时还没轮到开工：这张工单没碰过机器，游标保持不动
-      j.finish = start
-    }
-  }
-  return jobs
-}
-
-// 该农场全部工单重放（含已取消/已入库——它们历史上占用过机器时间，影响后续工单排期）
-function allJobs(farmId) {
-  return replay(q('SELECT * FROM production_jobs WHERE farm_id=? ORDER BY id', farmId))
-}
-
-// 当前在队（未领走）的工单 + 动态状态
-export function listJobs(currentAbs, farmId) {
+// 当前在队（未领走）的工单 + 动态状态。
+// viewer = { userId, role } 时附带协作权限（自己创建 / 管理员）与排队顺位、未开工投料。
+export function listJobs(currentAbs, farmId, viewer = null) {
+  const all = allJobs(farmId)
+  const userNames = usersOf(farmId)
+  const isManager = viewer && (viewer.role === 'admin' || viewer.role === 'owner')
+  // 可移动（尚未开工）的在制工单构成重排窗口，按计划顺序给出队首起的排队顺位
+  const movableIds = new Set(all
+    .filter((j) => j.status === 'running' && j.start > currentAbs)
+    .map((j) => j.id))
+  const movableList = all.filter((j) => movableIds.has(j.id))
   const jobs = []
-  for (const j of allJobs(farmId)) {
+  for (const j of all) {
     if (j.status === 'collected') continue
     j.doneBatches = finishedBatchesAt(j, currentAbs)
     // 已全部退料的取消工单没有可领成品，直接出队
@@ -212,9 +177,24 @@ export function listJobs(currentAbs, farmId) {
     j.remainDays = j.computedStatus === 'running'
       ? Math.max(0, j.finish - currentAbs)
       : 0
+    // 协作归属：谁排产的谁展示头像；旧工单 created_by 为空视为全场共有
+    j.createdByName = j.created_by != null ? (userNames.get(j.created_by) || `成员#${j.created_by}`) : null
+    if (viewer) {
+      j.owned = j.created_by == null || j.created_by === viewer.userId || isManager
+      j.canCancel = j.status === 'running' && j.owned
+      j.movable = movableIds.has(j.id) && j.owned
+      j.waitOrder = j.movable ? movableList.findIndex((x) => x.id === j.id) + 1 : 0
+      // 未开工批次锁定的原料（取消可退；品种明细原样追踪）
+      j.waitingInputs = j.status === 'running' ? waitingInputsOf(j, j.startedBatches) : []
+    }
     jobs.push(j)
   }
   return jobs
+}
+
+// 全农场原料占用汇总：所有在制工单未开工批次已出库、可退的原料（多人协作排产展示用）
+export function productionReserved(currentAbs, farmId) {
+  return reservedItems(allJobs(farmId), currentAbs)
 }
 
 // 在队批次占用（用于容量限制，已取消/已全部完工的工单不再占坑）
@@ -242,8 +222,10 @@ export function settleProduction(toAbs, farmId) {
   return logs
 }
 
-// 批量排产：一个配方一次下 n 批；原料当场全部扣走
-export function enqueueJob({ recipeId, qty, millLevel, currentAbs, farmId }) {
+// 批量排产：一个配方一次下 n 批；原料当场全部扣走（含品种逐项登记）。
+// userId 为排产成员：多人协作中工单按创建者归属，取消/重排权限据此判定；
+// seq 为队内计划顺序，新工单追加到队尾（在全部历史工单之后）。
+export function enqueueJob({ recipeId, qty, millLevel, currentAbs, farmId, userId }) {
   const r = getRecipe(recipeId)
   if (!r) throw Object.assign(new Error('配方不存在'), { status: 404 })
   const n = Math.max(1, Math.min(Math.floor(Number(qty) || 1), 99))
@@ -262,13 +244,16 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs, farmId }) {
     if (got < need) throw Object.assign(new Error(`原料不足：需要 ${r.fromName} ×${need}`), { status: 400 })
     // 按批次登记实际投料来源（基础作物/杂交品种逐项记录），取消未开工批次时原样退回
     const inputs = JSON.stringify(splitIntoBatches(taken, r.consume, n))
+    // 队尾计划顺序：取全农场最大 seq +1（历史工单也参与，保证新单排到最后）
+    const seq = (q1('SELECT COALESCE(MAX(seq),0) s FROM production_jobs WHERE farm_id=?', farmId)?.s || 0) + 1
     const res = run(
       `INSERT INTO production_jobs
        (farm_id,recipe_id,recipe_name,result_id,result_name,result_cat,from_id,from_name,from_cat,
-        consume,gain,days,qty,finished,enqueue_abs,inputs,status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,'running')`,
+        consume,gain,days,qty,finished,enqueue_abs,inputs,status,seq,created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,'running',?,?)`,
       farmId, r.id, r.name, r.result, r.resultName, r.resultCat,
-      r.from, r.fromName, r.fromCat, r.consume, r.gain, r.days, n, currentAbs, inputs
+      r.from, r.fromName, r.fromCat, r.consume, r.gain, r.days, n, currentAbs, inputs,
+      seq, userId ?? null
     )
     db.exec('COMMIT')
     return { ok: true, id: res.lastInsertRowid }
@@ -282,41 +267,25 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs, farmId }) {
 // 已完工批次保留成品待入库，加工中批次随取消作废。
 // 退料按排产时逐批登记的实际投料（可能含杂交品种作物）原样退回，
 // 而不是统一退成配方本源基础作物；旧工单无登记时回退按配方原料退。
-export function cancelJob({ id, currentAbs, farmId }) {
+// 多人协作：仅创建者本人或管理员/场主可取消（旧工单无创建者视为全场共有）。
+export function cancelJob({ id, currentAbs, farmId, viewer }) {
   const j = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
   if (!j) throw Object.assign(new Error('工单不存在'), { status: 404 })
   if (j.status !== 'running') throw Object.assign(new Error('该工单已结束，无法取消'), { status: 400 })
+  if (viewer) {
+    const isManager = viewer.role === 'admin' || viewer.role === 'owner'
+    if (j.created_by != null && j.created_by !== viewer.userId && !isManager) {
+      throw Object.assign(new Error('只能取消自己排产的工单（管理员可代操作）'), { status: 403 })
+    }
+  }
 
   const cur = allJobs(farmId).find((x) => x.id === id)
   const finishedBatches = finishedBatchesAt(cur, currentAbs)
   // 正在加工的批次已投入原料、尚未产出，取消即作废；只退还没开工的批次
   const startedBatches = startedBatchesAt(cur, currentAbs)
   const refundBatches = Math.max(0, j.qty - startedBatches)
-
-  // 机器按批次序号顺序加工，未开工的是尾部 refundBatches 批（下标 startedBatches..qty-1）
-  let refundItems = []
-  if (j.inputs) {
-    try {
-      const perBatch = JSON.parse(j.inputs)
-      if (Array.isArray(perBatch)) {
-        for (const inputs of perBatch.slice(startedBatches, j.qty)) {
-          for (const it of inputs || []) refundItems.push(it)
-        }
-      }
-    } catch { /* 登记损坏则回退旧逻辑 */ refundItems = [] }
-  }
-  const fallback = !j.inputs || refundItems.length === 0
-  if (fallback && refundBatches > 0) {
-    refundItems = [{ itemId: j.from_id, name: j.from_name, cat: j.from_cat, qty: j.consume * refundBatches }]
-  }
-  // 合并同一物品后逐条退回
-  const merged = new Map()
-  for (const it of refundItems) {
-    const cur2 = merged.get(it.itemId)
-    if (cur2) cur2.qty += it.qty
-    else merged.set(it.itemId, { ...it })
-  }
-  const refunds = [...merged.values()].filter((it) => it.qty > 0)
+  // 未开工的是尾部 refundBatches 批（下标 startedBatches..qty-1），按实际投料原样退回
+  const refunds = refundBatches > 0 ? waitingInputsOf(j, startedBatches) : []
 
   db.exec('BEGIN IMMEDIATE')
   try {
@@ -325,6 +294,34 @@ export function cancelJob({ id, currentAbs, farmId }) {
     for (const it of refunds) addInv(farmId, it.itemId, it.name, it.cat, it.qty)
     db.exec('COMMIT')
     return { ok: true, refundBatches, finishedBatches, refunds }
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 事务可能已结束，忽略 */ }
+    throw e
+  }
+}
+
+// 队列重排（多人协作）：把自己尚未开工的工单在排队窗口内上移/下移一位，
+// 与相邻排队工单交换计划顺序 seq；正在加工的工单是锚点，不能越过。
+// 只交换 seq：各工单逐批登记的投料不变，机器从下次空闲起按新顺序加工。
+export function reorderJob({ id, dir, currentAbs, farmId, viewer }) {
+  const j = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
+  if (!j) throw Object.assign(new Error('工单不存在'), { status: 404 })
+  if (viewer) {
+    const isManager = viewer.role === 'admin' || viewer.role === 'owner'
+    if (j.created_by != null && j.created_by !== viewer.userId && !isManager) {
+      throw Object.assign(new Error('只能调整自己排产的工单顺序（管理员可代操作）'), { status: 403 })
+    }
+  }
+  // 重放后由纯逻辑给出交换计划（并校验可移动性/边缘）
+  const { assign, swappedId } = planReorder(allJobs(farmId), currentAbs, id, String(dir || ''))
+  if (!assign.length) return { ok: true, moved: false }
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    for (const [jobId, newSeq] of assign) {
+      run('UPDATE production_jobs SET seq=? WHERE farm_id=? AND id=?', newSeq, farmId, jobId)
+    }
+    db.exec('COMMIT')
+    return { ok: true, moved: true, swappedId }
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 事务可能已结束，忽略 */ }
     throw e
