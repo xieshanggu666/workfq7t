@@ -61,6 +61,15 @@
       <div class="queue-stat">
         排产占用 <b :class="{full: store.queuedBatches >= store.queueCapacity}">{{ store.queuedBatches }}/{{ store.queueCapacity }}</b> 批
         <span class="tag">每批按游戏天加工，跨天自动推进</span>
+        <span class="tag">排队工单可上下重排，开工后锁定</span>
+      </div>
+      <div class="held-sum" v-if="store.productionReserved.length">
+        🔒 队列已锁原料：
+        <span class="tag held" v-for="it in store.productionReserved" :key="it.itemId"
+              :class="{gen:it.itemId.startsWith('crop-v')}">
+          {{ itemIcon(it.itemId) }} {{ it.name }} ×{{ it.qty }}
+        </span>
+        <span class="tag tip">取消未开工批次即原样退回（含🧬品种）</span>
       </div>
       <div class="row recipe" v-for="r in store.recipes" :key="r.id">
         <span class="i">{{ r.icon }}</span>
@@ -71,7 +80,9 @@
           <span class="tag">{{ r.fromIcon }} {{ r.fromName }} ×{{ r.consume }}/批</span>
           <span class="tag">→ {{ r.name }} ×{{ r.gain }}</span>
           <span class="tag">⏱ {{ r.days }} 天/批</span>
-          <span class="tag" :class="{mixed:r.baseCrop}">库存 ×{{ recipeStock(r) }}{{ r.baseCrop ? '（含🧬品种）' : '' }}</span>
+          <span class="tag" :class="{mixed:r.baseCrop}">
+            可用 ×{{ recipeStock(r) }}{{ recipeHeld(r) ? `（🔒${recipeHeld(r)}）` : '' }}{{ r.baseCrop ? '（含🧬品种）' : '' }}
+          </span>
         </div>
         <div class="proc-ctl">
           <button class="mini" :disabled="!canMake(r,1)" @click="doEnqueue(r,1)">排产×1</button>
@@ -90,19 +101,43 @@
         </button>
       </h4>
       <div v-if="!activeJobs.length" class="none">队列为空，去左侧选择配方批量排产吧</div>
-      <div v-for="j in activeJobs" :key="j.id" class="job" :class="j.computedStatus">
+      <div v-for="(j, i) in activeJobs" :key="j.id" class="job" :class="j.computedStatus">
+        <div class="reorder-ctl" v-if="j.status==='running' && isWaiting(j)">
+          <button class="mini arrow" :disabled="!canMove(i, -1)" title="提前一位" @click="store.reorderProduction(j.id,-1)">▲</button>
+          <button class="mini arrow" :disabled="!canMove(i, +1)" title="延后一位" @click="store.reorderProduction(j.id,+1)">▼</button>
+        </div>
+        <div class="reorder-ctl placeholder" v-else></div>
         <span class="i">{{ recipeIcon(j.recipe_id) }}</span>
         <div class="m-info">
           <b>
             {{ j.recipe_name }} ×{{ j.status==='canceled' ? j.gain*j.doneBatches : j.gain*j.qty }}
             <span class="job-state" :class="j.computedStatus">{{ stateLabel(j) }}</span>
+            <span class="creator" v-if="j.creator">
+              👤{{ j.creator.name }}
+              <i class="live-dot" :class="{on: store.onlineUserIds.has(j.creator.id)}"
+                 :title="store.onlineUserIds.has(j.creator.id) ? '排产人在线' : '排产人离线'"></i>
+            </span>
           </b>
           <span class="tag">批次 {{ j.doneBatches }}/{{ j.qty }}</span>
           <span class="tag" v-if="j.computedStatus==='running'">⏳ 约剩 {{ j.remainDays }} 天</span>
           <span class="tag" v-if="j.status==='canceled' && j.refundedBatches>0">已退 {{ j.refundedBatches }} 批原料</span>
+          <span class="tag held-line" v-if="j.status==='running' && j.occupiedItems && j.occupiedItems.length">
+            🔒投料
+            <i v-for="it in j.occupiedItems" :key="it.itemId" :class="{gen:it.itemId.startsWith('crop-v')}">
+              {{ itemIcon(it.itemId) }}{{ it.name }}×{{ it.qty }}
+            </i>
+          </span>
+          <span class="tag held-line" v-else-if="j.status==='canceled' && j.refundedBatches>0">
+            ↩退回
+            <i v-for="it in refundedOf(j)" :key="it.itemId" :class="{gen:it.itemId.startsWith('crop-v')}">
+              {{ itemIcon(it.itemId) }}{{ it.name }}×{{ it.qty }}
+            </i>
+          </span>
           <div class="job-bar"><i :style="{width:(j.doneBatches/j.qty*100)+'%'}"></i></div>
         </div>
-        <button v-if="j.status==='running'" class="mini" @click="store.cancelProduction(j.id)">取消退料</button>
+        <button v-if="j.status==='running'" class="mini" :disabled="!store.canManageJob(j)"
+                :title="store.canManageJob(j) ? '取消未开工批次并退回原料' : '只能取消自己排产的工单'"
+                @click="store.cancelProduction(j.id)">取消退料</button>
         <button v-if="(j.computedStatus==='done' || j.status==='canceled') && j.doneBatches>0"
                 class="mini green" @click="store.collectProduction(j.id)">
           入库 ×{{ j.gain*j.doneBatches }}
@@ -145,7 +180,9 @@
   <!-- 背包 -->
   <div v-if="tab==='bag'" class="page">
     <div class="pcol card">
-      <h4>🎒 我的背包</h4>
+      <h4>🎒 我的背包
+        <span class="tag tip" v-if="store.productionReserved.length">作物类为扣除工单投料后的空闲可用量，🔒锁定见加工坊</span>
+      </h4>
       <div v-if="!store.inventory.length" class="none">背包空空如也</div>
       <div class="grid">
         <div v-for="it in store.inventory" :key="it.item_id" class="bag-item">
@@ -239,6 +276,33 @@ function recipeStock(r) {
   }
   return total
 }
+// 某配方原料当前被在制工单锁定的数量（基础作物 + 同本源品种合并）
+function recipeHeld(r) {
+  let held = 0
+  if (!r.baseCrop) return heldOf(r.from)
+  held += heldOf('crop-' + r.baseCrop)
+  for (const v of store.varieties.filter((x) => x.base_id === r.baseCrop)) {
+    held += heldOf('crop-v' + v.id)
+  }
+  return held
+}
+function heldOf(itemId) {
+  return store.productionReserved.find((it) => it.itemId === itemId)?.qty || 0
+}
+// 库存物品图标（与背包一致；含杂交品种作物）
+function itemIcon(itemId) {
+  if (itemId.startsWith('crop-v') || itemId.startsWith('seed-v')) {
+    const id = Number(itemId.slice(6))
+    return store.varieties.find((x) => x.id === id)?.sprite || '🧬'
+  }
+  if (itemId.startsWith('crop-')) {
+    return store.crops.find((x) => x.id === Number(itemId.slice(5)))?.sprite || '🧺'
+  }
+  return {
+    flour: '🍞', juice: '🧃', cheese: '🧀', bread: '🥖', wool: '🧵', popcorn: '🍿', pickle: '🥬',
+    'p-chicken': '🥚', 'p-cow': '🥛', 'p-sheep': '🧶', 'disaster-kit': '🧱'
+  }[itemId] || '📦'
+}
 const runningTrials = computed(() => store.breeding?.running || 0)
 function recipeIcon(id) {
   return store.recipes.find((r) => r.id === id)?.icon || '🛠️'
@@ -258,6 +322,19 @@ async function doEnqueue(r, n) {
 }
 // 未领走的工单（完工未入库 / 加工中 / 已取消待入库）
 const activeJobs = computed(() => store.productionJobs)
+// 仍在排队等待（首批未开工）的 running 工单：这些参与重排
+function isWaiting(j) {
+  return j.status === 'running' && (j.start > (store.player?.abs_day ?? 0))
+}
+// 仅能在「连续等待工单」范围内相邻交换：目标位也必须是等待工单
+function canMove(index, dir) {
+  const target = activeJobs.value[index + dir]
+  return !!target && isWaiting(target)
+}
+// 取消单实际已退回的原料（服务端按登记明细返回；旧工单无明细时为空）
+function refundedOf(j) {
+  return j.refundedItems || []
+}
 // 可入库 = 全部完工 或 已取消（在制工单须整单完工后才能领）
 const collectableJobs = computed(() =>
   store.productionJobs.filter((j) => (j.computedStatus === 'done' || j.status === 'canceled') && j.doneBatches > 0)
@@ -334,4 +411,20 @@ h4 { margin:0 0 8px;color:#fff;display:flex;gap:8px;align-items:center; }
 .job-bar i{display:block;height:100%;background:linear-gradient(90deg,#2962ff,#5c97ff);transition:width .3s;}
 .job.done .job-bar i{background:#43a047;}
 h4 .collect-all{margin-left:auto;font-size:11px;}
+/* 协作排产 */
+.held-sum{font-size:11px;color:#8ba2c8;margin-bottom:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.held-sum .tag.held{color:#ffd54f;background:#2d2814;border:1px solid rgba(255,213,79,0.25);}
+.held-sum .tag.tip{color:#6f84ab;}
+.reorder-ctl{display:flex;flex-direction:column;gap:2px;flex-shrink:0;width:24px;}
+.reorder-ctl.placeholder{visibility:hidden;}
+.mini.arrow{padding:1px 0;font-size:9px;line-height:1.2;background:#16263f;border:1px solid rgba(120,160,220,0.25);border-radius:5px;}
+.mini.arrow:disabled{opacity:.4;}
+.creator{font-size:10px;font-weight:400;color:#8ba2c8;margin-left:8px;white-space:nowrap;}
+.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#4a5a78;margin-left:3px;vertical-align:middle;}
+.live-dot.on{background:#66bb6a;box-shadow:0 0 4px #66bb6a;}
+.tag.held-line{color:#ffd54f;background:transparent;padding:2px 4px 0;display:flex;gap:8px;flex-wrap:wrap;}
+.tag.held-line i{font-style:normal;color:#c9b27a;}
+.tag.held-line i.gen{color:#ce93d8;}
+.tag.gen, .held-sum .tag.gen{color:#ce93d8;background:#2a1b3d;}
+.job .mini[disabled]{cursor:not-allowed;}
 </style>

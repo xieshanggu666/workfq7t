@@ -71,6 +71,7 @@ export const useGameStore = defineStore('game', {
     weatherLog: [],
     recipes: [],
     productionJobs: [],
+    productionReserved: [],
     queueCapacity: 0,
     queuedBatches: 0,
     breeding: null,
@@ -102,12 +103,19 @@ export const useGameStore = defineStore('game', {
       }
       // 成员可用权限白名单（与服务端 ROLE_PERMS.member 对齐）
       return ['plant', 'water', 'fertilize', 'clean', 'harvest', 'protect', 'buymat', 'buyseed',
-        'sellcrop', 'adopt', 'feed', 'collect', 'enqueue', 'cancelJob', 'collectJob',
+        'sellcrop', 'adopt', 'feed', 'collect', 'enqueue', 'cancelJob', 'collectJob', 'reorderJob',
         'irrigToggle', 'irrigPriority', 'irrigTarget', 'careTrial', 'cancelTrial'].includes(perm)
     },
     // 管理员+
     canManage: (s) => s.role === 'admin' || s.role === 'owner',
     canOwner: (s) => s.role === 'owner',
+    // 协作排产：成员只能管理自己排产的工单（无排产人记录的旧工单视为公共），管理员可管理任意
+    canManageJob: (s) => (j) => {
+      if (!s.role) return false
+      if (s.role === 'owner' || s.role === 'admin') return true
+      return !j?.creator?.id || j.creator.id === s.user?.id
+    },
+    onlineUserIds: (s) => new Set((s.online || []).map((u) => u.id)),
     activeFarms: (s) => s.myFarms.filter((f) => f.status === 'active'),
     // 统一作物表：基础作物 + 杂交品种（id 均唯一）
     allCrops: (s) => {
@@ -279,6 +287,7 @@ export const useGameStore = defineStore('game', {
       this.weatherLog = d.weatherLog || []
       this.recipes = d.recipes || []
       this.productionJobs = d.productionJobs || []
+      this.productionReserved = d.productionReserved || []
       this.queueCapacity = d.queueCapacity || 0
       this.queuedBatches = d.queuedBatches || 0
       this.breeding = d.breeding || null
@@ -442,6 +451,14 @@ export const useGameStore = defineStore('game', {
         } else this.showToast('已取消（无未开工批次可退料）', 'info')
       }, { denyPerm: 'cancelJob' })
     },
+    async reorderProduction(id, dir) {
+      const r = await this._commit(async () => {
+        const d = await api('/production/reorder', 'POST', { id, dir })
+        await this.load({ silent: true })
+        return d
+      }, { denyPerm: 'reorderJob' })
+      return r
+    },
     async collectProduction(id = null) {
       await this._commit(async () => {
         const r = await api('/production/collect', 'POST', id == null ? {} : { id })
@@ -537,7 +554,7 @@ const ACTION_LABELS = {
   plant: '播种', water: '浇水', fertilize: '施肥', clean: '除虫', harvest: '收获',
   nextday: '时间推进/灾害结算', protect: '防灾投入', buymat: '购买物资', buyseed: '购买种子',
   sellcrop: '出售作物', adopt: '领养动物', feed: '喂食', collect: '收集产物',
-  'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/collect': '加工入库',
+  'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/reorder': '队列重排', 'production/collect': '加工入库',
   'irrigation/build': '建造灌溉设施', 'irrigation/toggle': '灌溉设施启停', 'irrigation/demolish': '拆除灌溉设施',
   'irrigation/priority': '灌溉优先级', 'irrigation/target': '灌溉目标水分',
   'breeding/start': '杂交试验', 'breeding/care': '试验养护', 'breeding/cancel': '取消试验',

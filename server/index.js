@@ -3,8 +3,8 @@ import { db } from './db.js'
 import { ensureLegacySeed } from './seed.js'
 import { TYPES, ensureWeather, settleWeather, currentWeather } from './weather.js'
 import {
-  RECIPES, capacity, listJobs, queuedBatches,
-  settleProduction, enqueueJob, cancelJob, collectJobs
+  RECIPES, capacity, listJobs, queuedBatches, reservedStock,
+  settleProduction, enqueueJob, cancelJob, reorderJob, collectJobs
 } from './production.js'
 import {
   COSTS as IRR_COSTS, RESERVOIR_CAP, networkInfo, computeNetworks, lastReport,
@@ -265,6 +265,8 @@ app.get('/api/state', authContext, (req, res) => {
     recipes: RECIPES,
     queueCapacity: capacity(mill?.level || 1),
     queuedBatches: queuedBatches(p.abs_day, fid),
+    // 协作排产：在制工单占用（已投料）的原料汇总，前端区分「空闲库存 / 被队列占用」
+    productionReserved: reservedStock(p.abs_day, fid),
     productionJobs: listJobs(p.abs_day, fid),
     breeding: {
       trials: listTrials(fid),
@@ -488,7 +490,7 @@ app.post('/api/collect', ...mutate('collect', 'collect', (req) => {
 }))
 
 // ===== 加工生产队列 =====
-// 批量排产：recipeId + qty（批次数）
+// 批量排产：recipeId + qty（批次数），记录排产人用于协作追踪与权限边界
 app.post('/api/production/enqueue', ...mutate('enqueue', 'production/enqueue', (req) => {
   const fid = req.ctx.farmId
   const p = q1('SELECT * FROM player WHERE farm_id=?', fid)
@@ -498,15 +500,30 @@ app.post('/api/production/enqueue', ...mutate('enqueue', 'production/enqueue', (
     qty: Number(req.body.qty) || 1,
     millLevel: mill?.level || 1,
     currentAbs: p.abs_day,
-    farmId: fid
+    farmId: fid,
+    userId: req.ctx.user.id,
+    userName: req.ctx.user.name
   })
 }))
 
-// 取消工单：退未开工批次的原料
+// 取消工单：退未开工批次的原料（只能取消自己排产的，管理员可取消任意工单）
 app.post('/api/production/cancel', ...mutate('cancelJob', 'production/cancel', (req) => {
   const fid = req.ctx.farmId
   const p = q1('SELECT abs_day FROM player WHERE farm_id=?', fid)
-  return cancelJob({ id: Number(req.body?.id), currentAbs: p.abs_day, farmId: fid })
+  return cancelJob({
+    id: Number(req.body?.id), currentAbs: p.abs_day, farmId: fid,
+    userId: req.ctx.user.id, role: req.ctx.role
+  })
+}))
+
+// 队列重排：未开工工单上移/下移一位，已开工工单钉死不动
+app.post('/api/production/reorder', ...mutate('reorderJob', 'production/reorder', (req) => {
+  const fid = req.ctx.farmId
+  const p = q1('SELECT abs_day FROM player WHERE farm_id=?', fid)
+  return reorderJob({
+    id: Number(req.body?.id), dir: Number(req.body?.dir),
+    currentAbs: p.abs_day, farmId: fid
+  })
 }))
 
 // 完工入库：传 id 领单个，不传则一键全领

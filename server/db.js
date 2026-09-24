@@ -9,6 +9,8 @@ export const db = new DatabaseSync(path.join(__dirname, 'farm.db'))
 db.exec('PRAGMA foreign_keys = ON;')
 db.exec('PRAGMA busy_timeout = 5000;')
 
+const q1 = (sql, ...p) => db.prepare(sql).get(...p)
+
 // ===== 联机共营相关表 =====
 // farms：一座农场即一个共营存档。id=1 为兼容旧单人存档预置的农场（owner_id 为空表示待认领）。
 db.exec(`
@@ -223,6 +225,24 @@ for (const t of ['plots', 'animals', 'weather_events', 'weather_log', 'productio
   }
 }
 
+// 协作排产扩展：工单补 seq（队列顺序）与 created_by/created_name（排产人）
+// 旧工单按 id 顺序补 seq，即历史排产顺序不变
+if (tableExists('production_jobs')) {
+  if (!columnExists('production_jobs', 'seq')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN seq INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!columnExists('production_jobs', 'created_by')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN created_by INTEGER')
+  }
+  if (!columnExists('production_jobs', 'created_name')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN created_name TEXT')
+  }
+  const needBackfill = q1('SELECT COUNT(*) c FROM production_jobs WHERE seq=0').c
+  if (needBackfill) {
+    db.exec('UPDATE production_jobs SET seq=id WHERE seq=0')
+  }
+}
+
 // 全新存档：建立完整多农场版表结构
 db.exec(`
 CREATE TABLE IF NOT EXISTS player (
@@ -369,6 +389,9 @@ CREATE TABLE IF NOT EXISTS production_jobs (
   enqueue_abs INTEGER NOT NULL,         -- 排产时的绝对天
   cancel_abs INTEGER DEFAULT NULL,      -- 取消时的绝对天（NULL 未取消）
   inputs TEXT DEFAULT NULL,             -- 按批次登记的实际投料明细（JSON，取消时原样退回）
+  seq INTEGER NOT NULL DEFAULT 0,       -- 队列顺序（多人协作可重排；历史顺序不再等同于 id）
+  created_by INTEGER,                   -- 排产人 users.id（NULL=升级前旧工单，任何成员可管理）
+  created_name TEXT,                    -- 排产人昵称快照（成员改名/退出后仍可展示）
   status TEXT NOT NULL DEFAULT 'running' -- running/done/canceled/collected
 );
 
@@ -446,7 +469,7 @@ export const ROLE_PERMS = {
     'plant', 'water', 'fertilize', 'clean', 'harvest',
     'protect', 'buymat', 'buyseed', 'sellcrop',
     'adopt', 'feed', 'collect',
-    'enqueue', 'cancelJob', 'collectJob',
+    'enqueue', 'cancelJob', 'collectJob', 'reorderJob',
     'irrigToggle', 'irrigPriority', 'irrigTarget',
     'careTrial', 'cancelTrial'
   ]),
